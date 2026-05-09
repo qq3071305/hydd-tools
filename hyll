@@ -1,0 +1,59 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/hihy/conf/config.yaml"
+DATA_DIR="/root/hyll-data"
+MONTH="${1:-$(date +%Y-%m)}"
+MONTH_FILE="$DATA_DIR/${MONTH}.json"
+
+SECRET="$(yq eval '.trafficStats.secret' "$CONFIG_FILE")"
+LISTEN="$(yq eval '.trafficStats.listen' "$CONFIG_FILE")"
+BASE="http://${LISTEN}"
+
+human_jq='
+def human:
+  ((. / 1073741824) * 100 | round) / 100 | tostring + "G";
+'
+
+print_table() {
+  if command -v column >/dev/null 2>&1; then
+    column -t -s $'\t'
+  else
+    cat
+  fi
+}
+
+echo
+echo "=== Online Users ==="
+curl -s -H "Authorization: $SECRET" "$BASE/online" \
+| jq -r '
+  to_entries
+  | sort_by(-(.value // 0), .key)
+  | (["User","Online"], ["----","------"], (.[] | [.key, (.value|tostring)]))
+  | @tsv
+' | print_table
+
+echo
+echo "=== Realtime Traffic ==="
+REALTIME="$(curl -s -H "Authorization: $SECRET" "$BASE/traffic")"
+echo "$REALTIME" \
+| jq -r "$human_jq
+  to_entries
+  | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
+  | ([\"User\",\"Upload\",\"Download\",\"Total\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+  | @tsv
+" | print_table
+
+echo
+echo "=== Monthly Traffic (${MONTH}) ==="
+if [ -f "$MONTH_FILE" ]; then
+  jq -r "$human_jq
+    to_entries
+    | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
+    | ([\"User\",\"Upload\",\"Download\",\"Total\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+    | @tsv
+  " "$MONTH_FILE" | print_table
+else
+  echo "No monthly data yet."
+fi
+echo
