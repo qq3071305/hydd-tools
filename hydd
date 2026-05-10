@@ -9,14 +9,14 @@ DEFAULT_PASS="480a7a90-654b-4d34-aa51-e154faae7326"
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    echo "Please run as root"
+    echo "请使用 root 用户运行"
     exit 1
   fi
 }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
-    echo "Missing command: $1"
+    echo "缺少命令：$1"
     exit 1
   }
 }
@@ -40,17 +40,17 @@ ensure_disabled_file() {
 
 user_exists() {
   local user="$1"
-  local v
-  v="$(yq eval ".auth.userpass.\"${user}\"" "$CONFIG_FILE" 2>/dev/null || true)"
-  [ -n "$v" ] && [ "$v" != "null" ]
+  local value
+  value="$(yq eval ".auth.userpass.\"${user}\"" "$CONFIG_FILE" 2>/dev/null || true)"
+  [ -n "$value" ] && [ "$value" != "null" ]
 }
 
 disabled_user_exists() {
   local user="$1"
+  local value
   ensure_disabled_file
-  local v
-  v="$(yq eval ".users.\"${user}\"" "$DISABLED_FILE" 2>/dev/null || true)"
-  [ -n "$v" ] && [ "$v" != "null" ]
+  value="$(yq eval ".users.\"${user}\"" "$DISABLED_FILE" 2>/dev/null || true)"
+  [ -n "$value" ] && [ "$value" != "null" ]
 }
 
 list_users_raw() {
@@ -85,33 +85,34 @@ get_default_user() {
 
 list_users() {
   local default_user
+  local has_disabled="0"
   default_user="$(get_default_user || true)"
 
   echo
-  echo "=== Enabled Users ==="
-  while read -r u; do
-    [ -z "$u" ] && continue
-    if [ "$u" = "$default_user" ] && [ -n "$default_user" ]; then
-      echo " - $u (default)"
+  echo "=== 已启用用户 ==="
+  while read -r user; do
+    [ -z "$user" ] && continue
+    if [ "$user" = "$default_user" ] && [ -n "$default_user" ]; then
+      echo " - $user（默认）"
     else
-      echo " - $u"
+      echo " - $user"
     fi
   done < <(list_users_raw)
 
   echo
-  echo "=== Disabled Users ==="
-  local has_disabled="0"
-  while read -r u; do
-    [ -z "$u" ] && continue
+  echo "=== 已禁用用户 ==="
+  while read -r user; do
+    [ -z "$user" ] && continue
     has_disabled="1"
-    echo " - $u"
+    echo " - $user"
   done < <(list_disabled_users_raw)
-  [ "$has_disabled" = "0" ] && echo " - none"
+
+  [ "$has_disabled" = "0" ] && echo " - 无"
   echo
 }
 
 restart_hihy() {
-  echo "Reloading hysteria2..."
+  echo "正在重载 hysteria2..."
 
   if command -v hihy >/dev/null 2>&1; then
     hihy stop >/dev/null 2>&1 || true
@@ -137,7 +138,7 @@ restart_hihy() {
     /etc/rc.d/hihy start >/dev/null 2>&1 && return 0
   fi
 
-  echo "Warning: auto restart failed. Run: pkill -f '/etc/hihy/bin/appS' && hihy start"
+  echo "警告：自动重启失败。请手动执行：pkill -f '/etc/hihy/bin/appS' && hihy start"
   return 1
 }
 
@@ -146,13 +147,31 @@ gen_pass() {
 }
 
 get_secret() {
-  yq eval '.trafficStats.secret' "$CONFIG_FILE"
+  yq eval '.trafficStats.secret' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d'
 }
 
 get_base() {
   local listen
-  listen="$(yq eval '.trafficStats.listen' "$CONFIG_FILE")"
+  listen="$(yq eval '.trafficStats.listen' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
+  [ -n "$listen" ] || {
+    echo "未找到 trafficStats.listen 配置" >&2
+    return 1
+  }
   echo "http://${listen}"
+}
+
+fetch_api_json() {
+  local endpoint="$1"
+  local secret base
+  secret="$(get_secret)"
+  base="$(get_base)"
+
+  [ -n "$secret" ] || {
+    echo "未找到 trafficStats.secret 配置" >&2
+    return 1
+  }
+
+  curl -fsS -H "Authorization: $secret" "${base}${endpoint}"
 }
 
 print_table() {
@@ -201,9 +220,9 @@ get_server_host() {
 get_insecure_flag() {
   local insecure="0"
   if [ -f "$BACKUP_FILE" ]; then
-    local v
-    v="$(yq eval '.insecure' "$BACKUP_FILE" 2>/dev/null | sed '/^null$/d' || true)"
-    [ "$v" = "true" ] && insecure="1"
+    local value
+    value="$(yq eval '.insecure' "$BACKUP_FILE" 2>/dev/null | sed '/^null$/d' || true)"
+    [ "$value" = "true" ] && insecure="1"
   fi
   echo "$insecure"
 }
@@ -289,7 +308,7 @@ socks5:
 YAML
 
   echo
-  echo "Saved config: ${output_file}"
+  echo "配置已保存：${output_file}"
   echo
   cat "$output_file"
   echo
@@ -301,12 +320,12 @@ show_user_qr() {
   url="$(build_user_url "$user")"
 
   if ! command -v qrencode >/dev/null 2>&1; then
-    echo "qrencode is not installed"
+    echo "未安装 qrencode"
     return
   fi
 
   echo
-  echo "Share link:"
+  echo "分享链接："
   echo "$url"
   echo
   qrencode -t ANSIUTF8 "$url"
@@ -317,73 +336,82 @@ show_user_profile_menu() {
   local user action url
 
   echo
-  echo "Enabled users only"
+  echo "仅支持已启用用户"
   list_users
-  read -p "Enter username: " user
+  read -r -p "请输入用户名：" user
 
   if [ -z "$user" ]; then
-    echo "Username cannot be empty"
+    echo "用户名不能为空"
     return
   fi
 
   if ! user_exists "$user"; then
-    echo "User not found or disabled: $user"
+    echo "用户不存在或已被禁用：$user"
     return
   fi
 
   while true; do
     echo "========================"
-    echo "   User Profile: $user"
+    echo "   用户配置：$user"
     echo "========================"
-    echo "1. Show share link"
-    echo "2. Save config to /root"
-    echo "3. Show QR code"
-    echo "0. Back"
+    echo "1. 显示分享链接"
+    echo "2. 保存配置到 /root"
+    echo "3. 显示二维码"
+    echo "0. 返回"
     echo "========================"
-    read -p "Choose: " action
+    read -r -p "请选择：" action
 
     case "$action" in
       1) url="$(build_user_url "$user")"; echo; echo "$url"; echo ;;
       2) save_user_yaml "$user" ;;
       3) show_user_qr "$user" ;;
       0) break ;;
-      *) echo "Invalid input"; echo ;;
+      *) echo "输入无效"; echo ;;
     esac
   done
 }
 
 show_realtime_stats() {
-  local secret base json total_tx total_rx
-  secret="$(get_secret)"
-  base="$(get_base)"
-  json="$(curl -s -H "Authorization: $secret" "$base/traffic")"
+  local online_json traffic_json total_tx total_rx
+
+  if ! online_json="$(fetch_api_json "/online")"; then
+    echo "获取在线用户数据失败"
+    echo
+    return
+  fi
+
+  if ! traffic_json="$(fetch_api_json "/traffic")"; then
+    echo "获取实时流量数据失败"
+    echo
+    return
+  fi
 
   echo
-  echo "=== Realtime Online Users ==="
-  curl -s -H "Authorization: $secret" "$base/online" \
+  echo "=== 实时在线用户 ==="
+  echo "$online_json" \
   | jq -r '
       to_entries
       | sort_by(-(.value // 0), .key)
-      | (["User","Online"], ["----","------"], (.[] | [.key, (.value|tostring)]))
+      | (["用户","在线数"], ["----","------"], (.[] | [.key, (.value|tostring)]))
       | @tsv
     ' | print_table
 
   echo
-  echo "=== Realtime Traffic (sorted by total) ==="
-  echo "$json" \
+  echo "=== 实时流量（按总量排序） ==="
+  echo "$traffic_json" \
   | jq -r "$human_jq
       to_entries
       | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-      | ([\"User\",\"Upload\",\"Download\",\"Total\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+      | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
       | @tsv
     " | print_table
 
-  total_tx="$(echo "$json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
-  total_rx="$(echo "$json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
+  total_tx="$(echo "$traffic_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
+  total_rx="$(echo "$traffic_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
   echo
-  echo "Total Upload: $(humanize_g "$total_tx")"
-  echo "Total Download: $(humanize_g "$total_rx")"
-  echo "Total Traffic: $(humanize_g $((total_tx + total_rx)))"
+  echo "总上传：$(humanize_g "$total_tx")"
+  echo "总下载：$(humanize_g "$total_rx")"
+  echo "总流量：$(humanize_g $((total_tx + total_rx)))"
   echo
 }
 
@@ -394,115 +422,124 @@ show_month_stats() {
 
   if [ ! -f "$month_file" ]; then
     echo
-    echo "=== Monthly Traffic ${month} ==="
-    echo "No monthly data"
+    echo "=== 月度流量 ${month} ==="
+    echo "暂无月度数据"
+    echo
+    return
+  fi
+
+  if ! jq empty "$month_file" >/dev/null 2>&1; then
+    echo
+    echo "=== 月度流量 ${month} ==="
+    echo "月度数据文件格式损坏：$month_file"
     echo
     return
   fi
 
   echo
-  echo "=== Monthly Traffic ${month} (sorted by total) ==="
+  echo "=== 月度流量 ${month}（按总量排序） ==="
   jq -r "$human_jq
       to_entries
       | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-      | ([\"User\",\"Upload\",\"Download\",\"Total\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+      | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
       | @tsv
     " "$month_file" | print_table
 
   total_tx="$(jq -r '[to_entries[].value.tx // 0] | add // 0' "$month_file")"
   total_rx="$(jq -r '[to_entries[].value.rx // 0] | add // 0' "$month_file")"
   echo
-  echo "Total Upload: $(humanize_g "$total_tx")"
-  echo "Total Download: $(humanize_g "$total_rx")"
-  echo "Total Traffic: $(humanize_g $((total_tx + total_rx)))"
+  echo "总上传：$(humanize_g "$total_tx")"
+  echo "总下载：$(humanize_g "$total_rx")"
+  echo "总流量：$(humanize_g $((total_tx + total_rx)))"
   echo
 }
 
 stats_menu() {
-  local month
+  local month choice
   while true; do
     echo "========================"
-    echo "      Stats Menu"
+    echo "       流量菜单"
     echo "========================"
-    echo "1. Realtime stats"
-    echo "2. Current month"
-    echo "3. Choose month"
-    echo "0. Back"
+    echo "1. 实时流量"
+    echo "2. 当前月份"
+    echo "3. 指定月份"
+    echo "0. 返回"
     echo "========================"
-    read -p "Choose: " choice
+    read -r -p "请选择：" choice
 
     case "$choice" in
       1) show_realtime_stats ;;
       2) show_month_stats ;;
       3)
-        read -p "Enter month (YYYY-MM): " month
+        read -r -p "请输入月份（YYYY-MM）：" month
         if [[ ! "$month" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-          echo "Invalid month format"
+          echo "月份格式无效"
           echo
         else
           show_month_stats "$month"
         fi
         ;;
       0) break ;;
-      *) echo "Invalid input"; echo ;;
+      *) echo "输入无效"; echo ;;
     esac
   done
 }
 
 clear_realtime_stats() {
-  local secret base confirm
-  secret="$(get_secret)"
-  base="$(get_base)"
+  local confirm
 
-  read -p "Clear realtime hysteria traffic stats? [y/N]: " confirm
+  read -r -p "确认清空实时 hysteria 流量统计吗？[y/N]：" confirm
   case "$confirm" in
     y|Y) ;;
-    *) echo "Cancelled"; echo; return ;;
+    *) echo "已取消"; echo; return ;;
   esac
 
   echo
-  echo "=== Returned before clear ==="
-  curl -s -H "Authorization: $secret" "$base/traffic?clear=1"
+  echo "=== 清空前返回的数据 ==="
+  if ! fetch_api_json "/traffic?clear=1"; then
+    echo "清空实时流量统计失败"
+    echo
+    return
+  fi
   echo
-  echo "Realtime stats cleared"
+  echo "实时流量统计已清空"
   echo
 }
 
 clear_month_stats() {
   local confirm month month_file
-  read -p "Enter month to clear (default $(date +%Y-%m)): " month
+  read -r -p "请输入要清空的月份（默认 $(date +%Y-%m)）：" month
   [ -n "$month" ] || month="$(date +%Y-%m)"
 
   if [[ ! "$month" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-    echo "Invalid month format"
+    echo "月份格式无效"
     echo
     return
   fi
 
   month_file="${DATA_DIR}/${month}.json"
-
-  read -p "Clear monthly stats for ${month}? [y/N]: " confirm
+  read -r -p "确认清空 ${month} 的月度统计吗？[y/N]：" confirm
   case "$confirm" in
     y|Y) ;;
-    *) echo "Cancelled"; echo; return ;;
+    *) echo "已取消"; echo; return ;;
   esac
 
   mkdir -p "$DATA_DIR"
   echo '{}' > "$month_file"
-  echo "Monthly stats cleared: $month_file"
+  echo "月度统计已清空：$month_file"
   echo
 }
 
 add_user() {
   local user pass
-  read -p "Enter username: " user
+  read -r -p "请输入用户名：" user
 
-  [ -n "$user" ] || { echo "Username cannot be empty"; return; }
-  validate_username "$user" || { echo "Only letters, numbers, dot, underscore and dash are allowed"; return; }
-  user_exists "$user" && { echo "User already exists: $user"; return; }
-  disabled_user_exists "$user" && { echo "User is currently disabled. Use enable instead."; return; }
+  [ -n "$user" ] || { echo "用户名不能为空"; return; }
+  validate_username "$user" || { echo "用户名仅允许字母、数字、点号、下划线和短横线"; return; }
+  user_exists "$user" && { echo "用户已存在：$user"; return; }
+  disabled_user_exists "$user" && { echo "该用户当前已被禁用，请使用启用功能恢复"; return; }
 
-  read -p "Enter password (blank uses default): " pass
+  read -r -p "请输入密码（留空则使用默认值）：" pass
   [ -n "$pass" ] || pass="$(gen_pass)"
 
   backup_files
@@ -515,37 +552,37 @@ add_user() {
 
   restart_hihy || true
   echo
-  echo "Added user: $user"
-  echo "Password: $pass"
+  echo "已添加用户：$user"
+  echo "密码：$pass"
   echo
 }
 
 del_user() {
-  local user total
+  local user total confirm
   list_users
-  read -p "Enter username to delete: " user
+  read -r -p "请输入要删除的用户名：" user
 
-  [ -n "$user" ] || { echo "Username cannot be empty"; return; }
+  [ -n "$user" ] || { echo "用户名不能为空"; return; }
 
   if user_exists "$user"; then
     total="$(count_users)"
-    [ "$total" -gt 1 ] || { echo "Cannot delete the last enabled user"; return; }
+    [ "$total" -gt 1 ] || { echo "不能删除最后一个已启用用户"; return; }
   elif ! disabled_user_exists "$user"; then
-    echo "User not found: $user"
+    echo "未找到用户：$user"
     return
   fi
 
-  read -p "Delete $user ? [y/N]: " confirm
+  read -r -p "确认删除 $user 吗？[y/N]：" confirm
   case "$confirm" in
     y|Y) ;;
-    *) echo "Cancelled"; return ;;
+    *) echo "已取消"; return ;;
   esac
 
   backup_files
 
   if user_exists "$user"; then
-    yq eval "del(.auth.userpass.\"${user}\")" -i "$CONFIG_FILE"
     local default_user new_default
+    yq eval "del(.auth.userpass.\"${user}\")" -i "$CONFIG_FILE"
     default_user="$(get_default_user || true)"
     if [ "$default_user" = "$user" ]; then
       new_default="$(list_users_raw | head -n 1)"
@@ -561,19 +598,19 @@ del_user() {
     yq eval "del(.users.\"${user}\")" -i "$DISABLED_FILE"
   fi
 
-  echo "Deleted user: $user"
+  echo "已删除用户：$user"
   echo
 }
 
 change_user_password() {
   local user pass
   list_users
-  read -p "Enter enabled username to change password: " user
+  read -r -p "请输入要修改密码的已启用用户名：" user
 
-  [ -n "$user" ] || { echo "Username cannot be empty"; return; }
-  user_exists "$user" || { echo "User not found or disabled: $user"; return; }
+  [ -n "$user" ] || { echo "用户名不能为空"; return; }
+  user_exists "$user" || { echo "用户不存在或已被禁用：$user"; return; }
 
-  read -p "Enter new password (blank uses default): " pass
+  read -r -p "请输入新密码（留空则使用默认值）：" pass
   [ -n "$pass" ] || pass="$(gen_pass)"
 
   backup_files
@@ -581,26 +618,26 @@ change_user_password() {
   restart_hihy || true
 
   echo
-  echo "Password updated for: $user"
-  echo "New password: $pass"
+  echo "密码已更新：$user"
+  echo "新密码：$pass"
   echo
 }
 
 disable_user() {
-  local user pass total default_user new_default
+  local user pass total default_user new_default confirm
   list_users
-  read -p "Enter username to disable: " user
+  read -r -p "请输入要禁用的用户名：" user
 
-  [ -n "$user" ] || { echo "Username cannot be empty"; return; }
-  user_exists "$user" || { echo "User not found or already disabled: $user"; return; }
+  [ -n "$user" ] || { echo "用户名不能为空"; return; }
+  user_exists "$user" || { echo "用户不存在或已经被禁用：$user"; return; }
 
   total="$(count_users)"
-  [ "$total" -gt 1 ] || { echo "Cannot disable the last enabled user"; return; }
+  [ "$total" -gt 1 ] || { echo "不能禁用最后一个已启用用户"; return; }
 
-  read -p "Disable $user ? [y/N]: " confirm
+  read -r -p "确认禁用 $user 吗？[y/N]：" confirm
   case "$confirm" in
     y|Y) ;;
-    *) echo "Cancelled"; return ;;
+    *) echo "已取消"; return ;;
   esac
 
   pass="$(get_user_password "$user")"
@@ -621,18 +658,18 @@ disable_user() {
 
   restart_hihy || true
   echo
-  echo "Disabled user: $user"
+  echo "已禁用用户：$user"
   echo
 }
 
 enable_user() {
   local user pass
   list_users
-  read -p "Enter username to enable: " user
+  read -r -p "请输入要启用的用户名：" user
 
-  [ -n "$user" ] || { echo "Username cannot be empty"; return; }
-  disabled_user_exists "$user" || { echo "User is not in disabled list: $user"; return; }
-  user_exists "$user" && { echo "User is already enabled: $user"; return; }
+  [ -n "$user" ] || { echo "用户名不能为空"; return; }
+  disabled_user_exists "$user" || { echo "该用户不在禁用列表中：$user"; return; }
+  user_exists "$user" && { echo "该用户已经启用：$user"; return; }
 
   pass="$(get_disabled_user_password "$user")"
   backup_files
@@ -647,7 +684,7 @@ enable_user() {
 
   restart_hihy || true
   echo
-  echo "Enabled user: $user"
+  echo "已启用用户：$user"
   echo
 }
 
@@ -655,24 +692,25 @@ show_menu() {
   echo "========================"
   echo "         HYDD"
   echo "========================"
-  echo "1. Add user"
-  echo "2. Delete user"
-  echo "3. List users"
-  echo "4. Traffic stats"
-  echo "5. Config / QR"
-  echo "6. Clear realtime stats"
-  echo "7. Clear monthly stats"
-  echo "8. Change password"
-  echo "9. Disable user"
-  echo "10. Enable user"
-  echo "0. Exit"
+  echo "1. 添加用户"
+  echo "2. 删除用户"
+  echo "3. 查看用户"
+  echo "4. 流量统计"
+  echo "5. 配置 / 二维码"
+  echo "6. 清空实时统计"
+  echo "7. 清空月度统计"
+  echo "8. 修改密码"
+  echo "9. 禁用用户"
+  echo "10. 启用用户"
+  echo "0. 退出"
   echo "========================"
 }
 
 main_menu() {
+  local choice
   while true; do
     show_menu
-    read -p "Choose: " choice
+    read -r -p "请选择：" choice
     case "$choice" in
       1) add_user ;;
       2) del_user ;;
@@ -685,7 +723,7 @@ main_menu() {
       9) disable_user ;;
       10) enable_user ;;
       0) exit 0 ;;
-      *) echo "Invalid input"; echo ;;
+      *) echo "输入无效"; echo ;;
     esac
   done
 }
@@ -696,44 +734,8 @@ need_cmd jq
 need_cmd curl
 
 [ -f "$CONFIG_FILE" ] || {
-  echo "Config not found: $CONFIG_FILE"
+  echo "未找到配置文件：$CONFIG_FILE"
   exit 1
 }
 
 main_menu
-EOF
-  chmod +x /usr/local/bin/hydd
-}
-
-setup_cron() {
-  mkdir -p "$DATA_DIR"
-  touch "$DATA_DIR/record.log"
-
-  crontab -l 2>/dev/null | grep -v '/root/hyll-record.sh' > /tmp/hy_cron.tmp || true
-  echo '*/5 * * * * /root/hyll-record.sh >> /root/hyll-data/record.log 2>&1' >> /tmp/hy_cron.tmp
-  crontab /tmp/hy_cron.tmp
-  rm -f /tmp/hy_cron.tmp
-}
-
-main() {
-  need_root
-  install_deps
-  check_hihy
-  mkdir -p "$DATA_DIR"
-  write_record_script
-  write_hyll
-  write_hydd
-  setup_cron
-  enable_cron
-
-  /root/hyll-record.sh || true
-
-  echo
-  echo "Install completed."
-  echo "Commands:"
-  echo "  hyll"
-  echo "  hydd"
-  echo
-}
-
-main "$@"

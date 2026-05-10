@@ -1,41 +1,93 @@
 # hydd-tools
 
-Small helper scripts for Hi_Hysteria:
+给 Hi_Hysteria 使用的一组中文化辅助脚本，包含安装、用户管理、流量查看和月度统计能力。
 
-- `hyll-record.sh`: collect monthly traffic snapshots every 5 minutes
-- `hyll`: show realtime and monthly traffic
-- `hydd`: manage users, view configs/QR codes, and clear stats
-- `hy-install.sh`: install the scripts onto a server that already has Hi_Hysteria
+快速使用：
 
-## Install
+```bash
+git clone https://github.com/qq3071305/hydd-tools
+cd hydd-tools
+chmod +x hy-install.sh
+sudo ./hy-install.sh
+```
 
-Clone this repository onto a server where Hi_Hysteria is already installed, then run:
+安装完成后可直接使用：
+
+```bash
+hydd
+hyll
+hyll 2026-05
+```
+
+## 功能说明
+
+- `hy-install.sh`：安装脚本，会复制文件、安装依赖并注册定时任务
+- `hydd`：用户管理面板，可添加、删除、禁用、启用用户，修改密码，查看配置和二维码
+- `hyll`：查看在线用户、实时流量和指定月份的月度流量
+- `hyll-record.sh`：每 5 分钟采集一次流量快照并累计到月度统计
+
+## 安装
+
+先把仓库克隆到已经安装好 Hi_Hysteria 的服务器上，然后执行：
 
 ```bash
 chmod +x hy-install.sh
 sudo ./hy-install.sh
 ```
 
-The installer will:
+安装脚本会自动：
 
-- copy `hyll-record.sh` to `/root/hyll-record.sh`
-- copy `hyll` and `hydd` to `/usr/local/bin`
-- create `/root/hyll-data`
-- register a cron task to collect stats every 5 minutes
-- enable and restart cron when possible
+- 把 `hyll-record.sh` 复制到 `/root/hyll-record.sh`
+- 把 `hyll` 和 `hydd` 复制到 `/usr/local/bin`
+- 创建 `/root/hyll-data`
+- 注册每 5 分钟采集一次统计数据的 `cron` 任务
+- 在支持的系统上启用并重启 `cron`
+- 自动安装 `curl`、`jq`、`qrencode` 和 `yq`
 
-## Commands
+## 常用命令
 
 ```bash
+hydd
 hyll
 hyll 2026-05
-hydd
 ```
 
-## Requirements
+## 使用说明
 
-- A working Hi_Hysteria install with `/etc/hihy/conf/config.yaml`
+`hydd` 菜单主要用于：
+
+- 添加用户
+- 删除用户
+- 查看已启用和已禁用用户
+- 查看实时流量和月度流量
+- 导出用户配置到 `/root`
+- 显示用户二维码
+- 清空实时统计和月度统计
+- 修改密码
+- 禁用或启用用户
+
+`hyll` 主要用于快速查看：
+
+- 当前在线用户
+- 当前实时流量
+- 指定月份流量汇总
+
+## 依赖要求
+
+- 已正常安装 Hi_Hysteria，并存在 `/etc/hihy/conf/config.yaml`
 - `curl`
 - `jq`
 - `yq`
-- `qrencode` for QR display in `hydd`
+- `qrencode`
+
+## 数据位置
+
+- 月度统计目录：`/root/hyll-data`
+- 月度统计文件：`/root/hyll-data/YYYY-MM.json`
+- 实时采集脚本：`/root/hyll-record.sh`
+
+## 说明
+
+- 当前脚本界面已经中文化
+- 安装脚本支持常见 Linux 包管理器
+- `yq` 下载已兼容 `amd64`、`arm64` 和 `arm`

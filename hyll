@@ -6,8 +6,8 @@ DATA_DIR="/root/hyll-data"
 MONTH="${1:-$(date +%Y-%m)}"
 MONTH_FILE="$DATA_DIR/${MONTH}.json"
 
-SECRET="$(yq eval '.trafficStats.secret' "$CONFIG_FILE")"
-LISTEN="$(yq eval '.trafficStats.listen' "$CONFIG_FILE")"
+SECRET="$(yq eval '.trafficStats.secret' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
+LISTEN="$(yq eval '.trafficStats.listen' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
 BASE="http://${LISTEN}"
 
 human_jq='
@@ -23,37 +23,66 @@ print_table() {
   fi
 }
 
-echo
-echo "=== Online Users ==="
-curl -s -H "Authorization: $SECRET" "$BASE/online" \
-| jq -r '
-  to_entries
-  | sort_by(-(.value // 0), .key)
-  | (["User","Online"], ["----","------"], (.[] | [.key, (.value|tostring)]))
-  | @tsv
-' | print_table
+need_config() {
+  [ -n "$SECRET" ] || {
+    echo "未找到 trafficStats.secret 配置"
+    exit 1
+  }
+  [ -n "$LISTEN" ] || {
+    echo "未找到 trafficStats.listen 配置"
+    exit 1
+  }
+}
+
+fetch_json() {
+  local endpoint="$1"
+  curl -fsS -H "Authorization: $SECRET" "${BASE}${endpoint}"
+}
+
+need_config
 
 echo
-echo "=== Realtime Traffic ==="
-REALTIME="$(curl -s -H "Authorization: $SECRET" "$BASE/traffic")"
-echo "$REALTIME" \
-| jq -r "$human_jq
-  to_entries
-  | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-  | ([\"User\",\"Upload\",\"Download\",\"Total\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
-  | @tsv
-" | print_table
+echo "=== 在线用户 ==="
+if online_json="$(fetch_json "/online")"; then
+  echo "$online_json" \
+  | jq -r '
+    to_entries
+    | sort_by(-(.value // 0), .key)
+    | (["用户","在线数"], ["----","------"], (.[] | [.key, (.value|tostring)]))
+    | @tsv
+  ' | print_table
+else
+  echo "获取在线用户数据失败。"
+fi
 
 echo
-echo "=== Monthly Traffic (${MONTH}) ==="
-if [ -f "$MONTH_FILE" ]; then
-  jq -r "$human_jq
+echo "=== 实时流量 ==="
+if realtime_json="$(fetch_json "/traffic")"; then
+  echo "$realtime_json" \
+  | jq -r "$human_jq
     to_entries
     | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-    | ([\"User\",\"Upload\",\"Download\",\"Total\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+    | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
     | @tsv
-  " "$MONTH_FILE" | print_table
+  " | print_table
 else
-  echo "No monthly data yet."
+  echo "获取实时流量数据失败。"
+fi
+
+echo
+echo "=== 月度流量（${MONTH}） ==="
+if [ -f "$MONTH_FILE" ]; then
+  if jq empty "$MONTH_FILE" >/dev/null 2>&1; then
+    jq -r "$human_jq
+      to_entries
+      | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
+      | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+      | @tsv
+    " "$MONTH_FILE" | print_table
+  else
+    echo "月度数据文件格式损坏：$MONTH_FILE"
+  fi
+else
+  echo "当前还没有月度数据。"
 fi
 echo
