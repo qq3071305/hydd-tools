@@ -21,8 +21,7 @@ BASE="http://${LISTEN}"
 }
 
 MONTH="$(date +%Y-%m)"
-RAW_FILE="$DATA_DIR/last_raw.json"
-MONTH_FILE="$DATA_DIR/${MONTH}.json"
+BASELINE_FILE="$DATA_DIR/${MONTH}.baseline.json"
 TMP_FILE="$DATA_DIR/current_raw.json.tmp"
 
 curl -fsS -H "Authorization: $SECRET" "$BASE/traffic" > "$TMP_FILE"
@@ -38,55 +37,9 @@ if ! jq empty "$TMP_FILE" >/dev/null 2>&1; then
   exit 1
 fi
 
-[ -f "$RAW_FILE" ] || echo '{}' > "$RAW_FILE"
-[ -f "$MONTH_FILE" ] || echo '{}' > "$MONTH_FILE"
-
-if ! jq empty "$RAW_FILE" >/dev/null 2>&1; then
-  echo '{}' > "$RAW_FILE"
+if [ ! -f "$BASELINE_FILE" ] || ! jq empty "$BASELINE_FILE" >/dev/null 2>&1; then
+  mv "$TMP_FILE" "$BASELINE_FILE"
+  echo "已建立本月基线：$BASELINE_FILE"
+else
+  rm -f "$TMP_FILE"
 fi
-
-if ! jq empty "$MONTH_FILE" >/dev/null 2>&1; then
-  echo '{}' > "$MONTH_FILE"
-fi
-
-# 第一次启用或手动重置本月后，只建立基线，不把历史总量直接计入月统计。
-if [ ! -s "$RAW_FILE" ] || [ "$(tr -d '[:space:]' < "$RAW_FILE")" = '{}' ]; then
-  mv "$TMP_FILE" "$RAW_FILE"
-  echo "首次运行：已建立流量基线，未累加到月度统计"
-  exit 0
-fi
-
-jq -n \
-  --slurpfile oldraw "$RAW_FILE" \
-  --slurpfile newraw "$TMP_FILE" \
-  --slurpfile monthsum "$MONTH_FILE" '
-  def users:
-    (($oldraw[0] // {}) + ($newraw[0] // {}) + ($monthsum[0] // {})) | keys[];
-
-  reduce users as $u
-    ({};
-      .[$u] = {
-        tx: (
-          (($monthsum[0][$u].tx // 0)) +
-          (
-            if (($newraw[0][$u].tx // 0) >= ($oldraw[0][$u].tx // 0))
-            then (($newraw[0][$u].tx // 0) - ($oldraw[0][$u].tx // 0))
-            else ($newraw[0][$u].tx // 0)
-            end
-          )
-        ),
-        rx: (
-          (($monthsum[0][$u].rx // 0)) +
-          (
-            if (($newraw[0][$u].rx // 0) >= ($oldraw[0][$u].rx // 0))
-            then (($newraw[0][$u].rx // 0) - ($oldraw[0][$u].rx // 0))
-            else ($newraw[0][$u].rx // 0)
-            end
-          )
-        )
-      }
-    )
-' > "${MONTH_FILE}.tmp"
-
-mv "${MONTH_FILE}.tmp" "$MONTH_FILE"
-mv "$TMP_FILE" "$RAW_FILE"

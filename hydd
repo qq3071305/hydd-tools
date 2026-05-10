@@ -526,7 +526,7 @@ clear_realtime_stats() {
 }
 
 clear_month_stats() {
-  local confirm month month_file raw_file
+  local confirm month baseline_file
   read -r -p "请输入要清空的月份（默认 $(date +%Y-%m)）：" month
   [ -n "$month" ] || month="$(date +%Y-%m)"
 
@@ -536,8 +536,7 @@ clear_month_stats() {
     return
   fi
 
-  month_file="${DATA_DIR}/${month}.json"
-  raw_file="${DATA_DIR}/last_raw.json"
+  baseline_file="${DATA_DIR}/${month}.baseline.json"
   read -r -p "确认清空 ${month} 的月度统计吗？[y/N]：" confirm
   case "$confirm" in
     y|Y) ;;
@@ -545,10 +544,9 @@ clear_month_stats() {
   esac
 
   mkdir -p "$DATA_DIR"
-  echo '{}' > "$month_file"
-  echo '{}' > "$raw_file"
-  echo "月度统计已重置：$month_file"
-  echo "基线已清空，下一次采样会重新建立基线"
+  rm -f "$baseline_file"
+  echo "本月基线已清空：$baseline_file"
+  echo "下一次运行 /root/hyll-record.sh 会重新建立月初基线"
   echo
 }
 

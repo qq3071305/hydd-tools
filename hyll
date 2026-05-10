@@ -14,7 +14,7 @@ else
 fi
 
 MONTH="${MONTH_ARG:-$(date +%Y-%m)}"
-MONTH_FILE="$DATA_DIR/${MONTH}.json"
+BASELINE_FILE="$DATA_DIR/${MONTH}.baseline.json"
 
 SECRET="$(yq eval '.trafficStats.secret' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
 LISTEN="$(yq eval '.trafficStats.listen' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
@@ -71,7 +71,27 @@ fetch_json() {
   curl -fsS -H "Authorization: $SECRET" "${BASE}${endpoint}"
 }
 
+calc_month_from_baseline() {
+  local current_json="$1"
+  local baseline_json="$2"
+  echo "$current_json" | jq -r --argjson base "$baseline_json" '
+    def users:
+      (. + $base) | keys_unsorted[];
+
+    reduce users as $u
+      ({};
+        .[$u] = {
+          tx: ((.[ $u ].tx // 0) - ($base[$u].tx // 0) | if . < 0 then 0 else . end),
+          rx: ((.[ $u ].rx // 0) - ($base[$u].rx // 0) | if . < 0 then 0 else . end)
+        }
+      )
+  '
+}
+
 render_once() {
+  local realtime_json total_tx total_rx
+  local month_json month_tx month_rx baseline_json
+
   echo
   echo "${CYAN}${BOLD}=== 在线用户 ===${RESET}"
   if online_json="$(fetch_json "/online")"; then
@@ -103,32 +123,32 @@ render_once() {
     echo "${GREEN}总上传：$(humanize_bytes "$total_tx")${RESET}"
     echo "${GREEN}总下载：$(humanize_bytes "$total_rx")${RESET}"
     echo "${GREEN}${BOLD}总流量：$(humanize_bytes $((total_tx + total_rx)))${RESET}"
-  else
-    echo "获取实时流量数据失败。"
-  fi
 
-  echo
-  echo "${CYAN}${BOLD}=== 月度流量（${MONTH}） ===${RESET}"
-  if [ -f "$MONTH_FILE" ]; then
-    if jq empty "$MONTH_FILE" >/dev/null 2>&1; then
-      jq -r "$human_jq
+    echo
+    echo "${CYAN}${BOLD}=== 本月累计（基于月初基线，${MONTH}） ===${RESET}"
+    if [ -f "$BASELINE_FILE" ] && jq empty "$BASELINE_FILE" >/dev/null 2>&1; then
+      baseline_json="$(cat "$BASELINE_FILE")"
+      month_json="$(calc_month_from_baseline "$realtime_json" "$baseline_json")"
+
+      echo "$month_json" \
+      | jq -r "$human_jq
         to_entries
         | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
         | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
         | @tsv
-      " "$MONTH_FILE" | print_table
+      " | print_table
 
-      total_tx="$(jq -r '[to_entries[].value.tx // 0] | add // 0' "$MONTH_FILE")"
-      total_rx="$(jq -r '[to_entries[].value.rx // 0] | add // 0' "$MONTH_FILE")"
+      month_tx="$(echo "$month_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
+      month_rx="$(echo "$month_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
       echo
-      echo "月总上传：$(humanize_bytes "$total_tx")"
-      echo "月总下载：$(humanize_bytes "$total_rx")"
-      echo "月总流量：$(humanize_bytes $((total_tx + total_rx)))"
+      echo "月总上传：$(humanize_bytes "$month_tx")"
+      echo "月总下载：$(humanize_bytes "$month_rx")"
+      echo "月总流量：$(humanize_bytes $((month_tx + month_rx)))"
     else
-      echo "月度数据文件格式损坏：$MONTH_FILE"
+      echo "暂无本月基线，请先运行 /root/hyll-record.sh 建立基线。"
     fi
   else
-    echo "当前还没有月度数据。"
+    echo "获取实时流量数据失败。"
   fi
   echo
 }
