@@ -3,7 +3,17 @@ set -euo pipefail
 
 CONFIG_FILE="/etc/hihy/conf/config.yaml"
 DATA_DIR="/root/hyll-data"
-MONTH="${1:-$(date +%Y-%m)}"
+WATCH_MODE="${1:-}"
+WATCH_INTERVAL="${2:-3}"
+MONTH_ARG="${1:-}"
+
+if [ "$WATCH_MODE" = "--watch" ] || [ "$WATCH_MODE" = "watch" ]; then
+  MONTH_ARG="$(date +%Y-%m)"
+else
+  WATCH_MODE=""
+fi
+
+MONTH="${MONTH_ARG:-$(date +%Y-%m)}"
 MONTH_FILE="$DATA_DIR/${MONTH}.json"
 
 SECRET="$(yq eval '.trafficStats.secret' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
@@ -15,6 +25,18 @@ def human_pair:
   ((((. / 1048576) * 100 | round) / 100 | tostring) + "MB (" +
   (((. / 1073741824) * 100 | round) / 100 | tostring) + "GB)");
 '
+
+if [ -t 1 ]; then
+  GREEN="$(printf '\033[32m')"
+  CYAN="$(printf '\033[36m')"
+  BOLD="$(printf '\033[1m')"
+  RESET="$(printf '\033[0m')"
+else
+  GREEN=""
+  CYAN=""
+  BOLD=""
+  RESET=""
+fi
 
 print_table() {
   if command -v column >/dev/null 2>&1; then
@@ -49,64 +71,78 @@ fetch_json() {
   curl -fsS -H "Authorization: $SECRET" "${BASE}${endpoint}"
 }
 
-need_config
-
-echo
-echo "=== 在线用户 ==="
-if online_json="$(fetch_json "/online")"; then
-  echo "$online_json" \
-  | jq -r '
-    to_entries
-    | sort_by(-(.value // 0), .key)
-    | (["用户","在线数"], ["----","------"], (.[] | [.key, (.value|tostring)]))
-    | @tsv
-  ' | print_table
-else
-  echo "获取在线用户数据失败。"
-fi
-
-echo
-echo "=== 实时流量 ==="
-if realtime_json="$(fetch_json "/traffic")"; then
-  echo "$realtime_json" \
-  | jq -r "$human_jq
-    to_entries
-    | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-    | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
-    | @tsv
-  " | print_table
-
-  total_tx="$(echo "$realtime_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
-  total_rx="$(echo "$realtime_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
+render_once() {
   echo
-  echo "总上传：$(humanize_bytes "$total_tx")"
-  echo "总下载：$(humanize_bytes "$total_rx")"
-  echo "总流量：$(humanize_bytes $((total_tx + total_rx)))"
-else
-  echo "获取实时流量数据失败。"
-fi
+  echo "${CYAN}${BOLD}=== 在线用户 ===${RESET}"
+  if online_json="$(fetch_json "/online")"; then
+    echo "$online_json" \
+    | jq -r '
+      to_entries
+      | sort_by(-(.value // 0), .key)
+      | (["用户","在线数"], ["----","------"], (.[] | [.key, (.value|tostring)]))
+      | @tsv
+    ' | print_table
+  else
+    echo "获取在线用户数据失败。"
+  fi
 
-echo
-echo "=== 月度流量（${MONTH}） ==="
-if [ -f "$MONTH_FILE" ]; then
-  if jq empty "$MONTH_FILE" >/dev/null 2>&1; then
-    jq -r "$human_jq
+  echo
+  echo "${GREEN}${BOLD}=== 实时流量 ===${RESET}"
+  if realtime_json="$(fetch_json "/traffic")"; then
+    echo "$realtime_json" \
+    | jq -r "$human_jq
       to_entries
       | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
       | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
       | @tsv
-    " "$MONTH_FILE" | print_table
+    " | print_table
 
-    total_tx="$(jq -r '[to_entries[].value.tx // 0] | add // 0' "$MONTH_FILE")"
-    total_rx="$(jq -r '[to_entries[].value.rx // 0] | add // 0' "$MONTH_FILE")"
+    total_tx="$(echo "$realtime_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
+    total_rx="$(echo "$realtime_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
     echo
-    echo "月总上传：$(humanize_bytes "$total_tx")"
-    echo "月总下载：$(humanize_bytes "$total_rx")"
-    echo "月总流量：$(humanize_bytes $((total_tx + total_rx)))"
+    echo "${GREEN}总上传：$(humanize_bytes "$total_tx")${RESET}"
+    echo "${GREEN}总下载：$(humanize_bytes "$total_rx")${RESET}"
+    echo "${GREEN}${BOLD}总流量：$(humanize_bytes $((total_tx + total_rx)))${RESET}"
   else
-    echo "月度数据文件格式损坏：$MONTH_FILE"
+    echo "获取实时流量数据失败。"
   fi
+
+  echo
+  echo "${CYAN}${BOLD}=== 月度流量（${MONTH}） ===${RESET}"
+  if [ -f "$MONTH_FILE" ]; then
+    if jq empty "$MONTH_FILE" >/dev/null 2>&1; then
+      jq -r "$human_jq
+        to_entries
+        | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
+        | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
+        | @tsv
+      " "$MONTH_FILE" | print_table
+
+      total_tx="$(jq -r '[to_entries[].value.tx // 0] | add // 0' "$MONTH_FILE")"
+      total_rx="$(jq -r '[to_entries[].value.rx // 0] | add // 0' "$MONTH_FILE")"
+      echo
+      echo "月总上传：$(humanize_bytes "$total_tx")"
+      echo "月总下载：$(humanize_bytes "$total_rx")"
+      echo "月总流量：$(humanize_bytes $((total_tx + total_rx)))"
+    else
+      echo "月度数据文件格式损坏：$MONTH_FILE"
+    fi
+  else
+    echo "当前还没有月度数据。"
+  fi
+  echo
+}
+
+need_config
+
+if [ -n "$WATCH_MODE" ]; then
+  while true; do
+    clear
+    echo "${GREEN}${BOLD}实时流量监控中，每 ${WATCH_INTERVAL} 秒刷新一次${RESET}"
+    echo "按 Ctrl+C 退出"
+    render_once
+    sleep "$WATCH_INTERVAL"
+  done
 else
-  echo "当前还没有月度数据。"
+  render_once
 fi
-echo
