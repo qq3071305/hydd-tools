@@ -182,14 +182,19 @@ print_table() {
   fi
 }
 
-humanize_g() {
+humanize_bytes() {
   local bytes="${1:-0}"
-  awk -v b="$bytes" 'BEGIN { printf "%.2fG", b/1073741824 }'
+  awk -v b="$bytes" 'BEGIN {
+    mb = b / 1048576;
+    gb = b / 1073741824;
+    printf "%.2fMB (%.2fGB)", mb, gb;
+  }'
 }
 
 human_jq='
-def human:
-  ((. / 1073741824) * 100 | round) / 100 | tostring + "G";
+def human_pair:
+  ((((. / 1048576) * 100 | round) / 100 | tostring) + "MB (" +
+  (((. / 1073741824) * 100 | round) / 100 | tostring) + "GB)");
 '
 
 get_primary_port() {
@@ -402,16 +407,16 @@ show_realtime_stats() {
   | jq -r "$human_jq
       to_entries
       | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-      | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+      | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
       | @tsv
     " | print_table
 
   total_tx="$(echo "$traffic_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
   total_rx="$(echo "$traffic_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
   echo
-  echo "总上传：$(humanize_g "$total_tx")"
-  echo "总下载：$(humanize_g "$total_rx")"
-  echo "总流量：$(humanize_g $((total_tx + total_rx)))"
+  echo "总上传：$(humanize_bytes "$total_tx")"
+  echo "总下载：$(humanize_bytes "$total_rx")"
+  echo "总流量：$(humanize_bytes $((total_tx + total_rx)))"
   echo
 }
 
@@ -441,16 +446,16 @@ show_month_stats() {
   jq -r "$human_jq
       to_entries
       | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-      | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+      | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
       | @tsv
     " "$month_file" | print_table
 
   total_tx="$(jq -r '[to_entries[].value.tx // 0] | add // 0' "$month_file")"
   total_rx="$(jq -r '[to_entries[].value.rx // 0] | add // 0' "$month_file")"
   echo
-  echo "总上传：$(humanize_g "$total_tx")"
-  echo "总下载：$(humanize_g "$total_rx")"
-  echo "总流量：$(humanize_g $((total_tx + total_rx)))"
+  echo "月总上传：$(humanize_bytes "$total_tx")"
+  echo "月总下载：$(humanize_bytes "$total_rx")"
+  echo "月总流量：$(humanize_bytes $((total_tx + total_rx)))"
   echo
 }
 
@@ -507,7 +512,7 @@ clear_realtime_stats() {
 }
 
 clear_month_stats() {
-  local confirm month month_file
+  local confirm month month_file raw_file
   read -r -p "请输入要清空的月份（默认 $(date +%Y-%m)）：" month
   [ -n "$month" ] || month="$(date +%Y-%m)"
 
@@ -518,6 +523,7 @@ clear_month_stats() {
   fi
 
   month_file="${DATA_DIR}/${month}.json"
+  raw_file="${DATA_DIR}/last_raw.json"
   read -r -p "确认清空 ${month} 的月度统计吗？[y/N]：" confirm
   case "$confirm" in
     y|Y) ;;
@@ -526,7 +532,9 @@ clear_month_stats() {
 
   mkdir -p "$DATA_DIR"
   echo '{}' > "$month_file"
-  echo "月度统计已清空：$month_file"
+  echo '{}' > "$raw_file"
+  echo "月度统计已重置：$month_file"
+  echo "基线已清空，下一次采样会重新建立基线"
   echo
 }
 
@@ -698,7 +706,7 @@ show_menu() {
   echo "4. 流量统计"
   echo "5. 配置 / 二维码"
   echo "6. 清空实时统计"
-  echo "7. 清空月度统计"
+  echo "7. 重置本月统计"
   echo "8. 修改密码"
   echo "9. 禁用用户"
   echo "10. 启用用户"

@@ -11,8 +11,9 @@ LISTEN="$(yq eval '.trafficStats.listen' "$CONFIG_FILE" 2>/dev/null | sed '/^nul
 BASE="http://${LISTEN}"
 
 human_jq='
-def human:
-  ((. / 1073741824) * 100 | round) / 100 | tostring + "G";
+def human_pair:
+  ((((. / 1048576) * 100 | round) / 100 | tostring) + "MB (" +
+  (((. / 1073741824) * 100 | round) / 100 | tostring) + "GB)");
 '
 
 print_table() {
@@ -21,6 +22,15 @@ print_table() {
   else
     cat
   fi
+}
+
+humanize_bytes() {
+  local bytes="${1:-0}"
+  awk -v b="$bytes" 'BEGIN {
+    mb = b / 1048576;
+    gb = b / 1073741824;
+    printf "%.2fMB (%.2fGB)", mb, gb;
+  }'
 }
 
 need_config() {
@@ -62,9 +72,16 @@ if realtime_json="$(fetch_json "/traffic")"; then
   | jq -r "$human_jq
     to_entries
     | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-    | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+    | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
     | @tsv
   " | print_table
+
+  total_tx="$(echo "$realtime_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
+  total_rx="$(echo "$realtime_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
+  echo
+  echo "总上传：$(humanize_bytes "$total_tx")"
+  echo "总下载：$(humanize_bytes "$total_rx")"
+  echo "总流量：$(humanize_bytes $((total_tx + total_rx)))"
 else
   echo "获取实时流量数据失败。"
 fi
@@ -76,9 +93,16 @@ if [ -f "$MONTH_FILE" ]; then
     jq -r "$human_jq
       to_entries
       | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-      | ([\"用户\",\"上传\",\"下载\",\"总计\"], [\"----\",\"------\",\"--------\",\"-----\"], (.[] | [.key, (.value.tx|human), (.value.rx|human), ((.value.tx + .value.rx)|human)]))
+      | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
       | @tsv
     " "$MONTH_FILE" | print_table
+
+    total_tx="$(jq -r '[to_entries[].value.tx // 0] | add // 0' "$MONTH_FILE")"
+    total_rx="$(jq -r '[to_entries[].value.rx // 0] | add // 0' "$MONTH_FILE")"
+    echo
+    echo "月总上传：$(humanize_bytes "$total_tx")"
+    echo "月总下载：$(humanize_bytes "$total_rx")"
+    echo "月总流量：$(humanize_bytes $((total_tx + total_rx)))"
   else
     echo "月度数据文件格式损坏：$MONTH_FILE"
   fi

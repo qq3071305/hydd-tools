@@ -49,6 +49,13 @@ if ! jq empty "$MONTH_FILE" >/dev/null 2>&1; then
   echo '{}' > "$MONTH_FILE"
 fi
 
+# 第一次启用或手动重置本月后，只建立基线，不把历史总量直接计入月统计。
+if [ ! -s "$RAW_FILE" ] || [ "$(tr -d '[:space:]' < "$RAW_FILE")" = '{}' ]; then
+  mv "$TMP_FILE" "$RAW_FILE"
+  echo "首次运行：已建立流量基线，未累加到月度统计"
+  exit 0
+fi
+
 jq -n \
   --slurpfile oldraw "$RAW_FILE" \
   --slurpfile newraw "$TMP_FILE" \
