@@ -6,6 +6,9 @@ BACKUP_FILE="/etc/hihy/conf/backup.yaml"
 DISABLED_FILE="/etc/hihy/conf/disabled-users.yaml"
 DATA_DIR="/root/hyll-data"
 DEFAULT_PASS="480a7a90-654b-4d34-aa51-e154faae7326"
+LAST_BACKUP_TS=""
+BACKUP_HAD_BACKUP_FILE="0"
+BACKUP_HAD_DISABLED_FILE="0"
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -28,9 +31,59 @@ validate_username() {
 backup_files() {
   local ts
   ts="$(date +%F-%H%M%S)"
+  LAST_BACKUP_TS="$ts"
+  BACKUP_HAD_BACKUP_FILE="0"
+  BACKUP_HAD_DISABLED_FILE="0"
   cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.${ts}"
-  [ -f "$BACKUP_FILE" ] && cp "$BACKUP_FILE" "${BACKUP_FILE}.bak.${ts}"
-  [ -f "$DISABLED_FILE" ] && cp "$DISABLED_FILE" "${DISABLED_FILE}.bak.${ts}"
+  if [ -f "$BACKUP_FILE" ]; then
+    BACKUP_HAD_BACKUP_FILE="1"
+    cp "$BACKUP_FILE" "${BACKUP_FILE}.bak.${ts}"
+  fi
+  if [ -f "$DISABLED_FILE" ]; then
+    BACKUP_HAD_DISABLED_FILE="1"
+    cp "$DISABLED_FILE" "${DISABLED_FILE}.bak.${ts}"
+  fi
+}
+
+rollback_files() {
+  [ -n "$LAST_BACKUP_TS" ] || return 1
+  [ -f "${CONFIG_FILE}.bak.${LAST_BACKUP_TS}" ] || return 1
+
+  cp "${CONFIG_FILE}.bak.${LAST_BACKUP_TS}" "$CONFIG_FILE"
+
+  if [ "$BACKUP_HAD_BACKUP_FILE" = "1" ] && [ -f "${BACKUP_FILE}.bak.${LAST_BACKUP_TS}" ]; then
+    cp "${BACKUP_FILE}.bak.${LAST_BACKUP_TS}" "$BACKUP_FILE"
+  else
+    rm -f "$BACKUP_FILE"
+  fi
+
+  if [ "$BACKUP_HAD_DISABLED_FILE" = "1" ] && [ -f "${DISABLED_FILE}.bak.${LAST_BACKUP_TS}" ]; then
+    cp "${DISABLED_FILE}.bak.${LAST_BACKUP_TS}" "$DISABLED_FILE"
+  else
+    rm -f "$DISABLED_FILE"
+  fi
+}
+
+restart_or_rollback() {
+  if restart_hihy; then
+    return 0
+  fi
+
+  echo "服务重启失败，正在回滚到修改前配置..."
+  if rollback_files; then
+    if restart_hihy; then
+      echo "已回滚到修改前配置。"
+    else
+      echo "配置已回滚，但服务仍未成功启动，请手动检查。"
+    fi
+  else
+    echo "未找到可用备份，无法自动回滚。"
+  fi
+  return 1
+}
+
+strip_null() {
+  sed '/^null$/d;/^$/d'
 }
 
 ensure_disabled_file() {
@@ -147,12 +200,12 @@ gen_pass() {
 }
 
 get_secret() {
-  yq eval '.trafficStats.secret' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d'
+  yq eval '.trafficStats.secret' "$CONFIG_FILE" 2>/dev/null | strip_null
 }
 
 get_base() {
   local listen
-  listen="$(yq eval '.trafficStats.listen' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
+  listen="$(yq eval '.trafficStats.listen' "$CONFIG_FILE" 2>/dev/null | strip_null)"
   [ -n "$listen" ] || {
     echo "未找到 trafficStats.listen 配置" >&2
     return 1
@@ -164,14 +217,17 @@ fetch_api_json() {
   local endpoint="$1"
   local secret base
   secret="$(get_secret)"
-  base="$(get_base)"
 
   [ -n "$secret" ] || {
     echo "未找到 trafficStats.secret 配置" >&2
     return 1
   }
 
-  curl -fsS -H "Authorization: $secret" "${base}${endpoint}"
+  if ! base="$(get_base)"; then
+    return 1
+  fi
+
+  curl --fail --silent --show-error --max-time 10 -H "Authorization: $secret" "${base}${endpoint}"
 }
 
 print_table() {
@@ -208,6 +264,159 @@ def human_pair:
   ((((. / 1048576) * 100 | round) / 100 | tostring) + "MB (" +
   (((. / 1073741824) * 100 | round) / 100 | tostring) + "GB)");
 '
+
+calc_month_from_baseline() {
+  local current_json="$1"
+  local baseline_json="$2"
+  echo "$current_json" | jq -r --argjson base "$baseline_json" '
+    def users:
+      (. + $base) | keys_unsorted[];
+
+    reduce users as $u
+      ({};
+        .[$u] = {
+          tx: ((.[ $u ].tx // 0) - ($base[$u].tx // 0) | if . < 0 then 0 else . end),
+          rx: ((.[ $u ].rx // 0) - ($base[$u].rx // 0) | if . < 0 then 0 else . end)
+        }
+      )
+  '
+}
+
+show_dashboard() {
+  local month="${1:-$(date +%Y-%m)}"
+  local baseline_file="${DATA_DIR}/${month}.baseline.json"
+  local online_json realtime_json total_tx total_rx month_json month_tx month_rx baseline_json
+
+  echo
+  echo "${CYAN}${BOLD}=== 在线用户 ===${RESET}"
+  if online_json="$(fetch_api_json "/online")"; then
+    if echo "$online_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      echo "$online_json" \
+      | jq -r '
+        to_entries
+        | sort_by(-(.value // 0), .key)
+        | (["用户","在线数"], ["----","------"], (.[] | [.key, (.value|tostring)]))
+        | @tsv
+      ' | print_table
+    else
+      echo "在线用户接口返回了无效数据。"
+    fi
+  else
+    echo "获取在线用户数据失败。"
+  fi
+
+  echo
+  echo "${GREEN}${BOLD}=== 实时流量 ===${RESET}"
+  if realtime_json="$(fetch_api_json "/traffic")"; then
+    if echo "$realtime_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      echo "$realtime_json" \
+      | jq -r "$human_jq
+        to_entries
+        | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
+        | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
+        | @tsv
+      " | print_table
+
+      total_tx="$(echo "$realtime_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
+      total_rx="$(echo "$realtime_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
+      echo
+      echo "${GREEN}总上传：$(humanize_bytes "$total_tx")${RESET}"
+      echo "${GREEN}总下载：$(humanize_bytes "$total_rx")${RESET}"
+      echo "${GREEN}${BOLD}总流量：$(humanize_bytes $((total_tx + total_rx)))${RESET}"
+
+      echo
+      echo "${CYAN}${BOLD}=== 本月累计（基于月初基线，${month}） ===${RESET}"
+      if [ -f "$baseline_file" ] && jq empty "$baseline_file" >/dev/null 2>&1; then
+        baseline_json="$(cat "$baseline_file")"
+        month_json="$(calc_month_from_baseline "$realtime_json" "$baseline_json")"
+
+        echo "$month_json" \
+        | jq -r "$human_jq
+          to_entries
+          | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
+          | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
+          | @tsv
+        " | print_table
+
+        month_tx="$(echo "$month_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
+        month_rx="$(echo "$month_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
+        echo
+        echo "月总上传：$(humanize_bytes "$month_tx")"
+        echo "月总下载：$(humanize_bytes "$month_rx")"
+        echo "月总流量：$(humanize_bytes $((month_tx + month_rx)))"
+      else
+        echo "暂无本月基线，请先运行 /root/hyll-record.sh 建立基线。"
+      fi
+    else
+      echo "实时流量接口返回了无效数据。"
+    fi
+  else
+    echo "获取实时流量数据失败。"
+  fi
+  echo
+}
+
+watch_dashboard() {
+  local interval="${1:-3}"
+  while true; do
+    clear
+    echo "${GREEN}${BOLD}实时流量监控中，每 ${interval} 秒刷新一次${RESET}"
+    echo "按 Ctrl+C 退出"
+    show_dashboard
+    sleep "$interval"
+  done
+}
+
+show_hy2_port_stats() {
+  local json main_port input_bytes output_bytes total_bytes main_in hop_in main_out hop_out
+
+  if ! command -v nft >/dev/null 2>&1; then
+    echo "缺少命令：nft"
+    echo
+    return
+  fi
+
+  if ! json="$(nft -j list table inet hy2acct 2>/dev/null)"; then
+    echo "读取 nftables 统计表失败，请确认 hy2acct 表存在。"
+    echo
+    return
+  fi
+
+  if ! echo "$json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo "nftables 返回了无效的 JSON 数据。"
+    echo
+    return
+  fi
+
+  main_port="$(get_primary_port)"
+  [ -n "$main_port" ] || main_port="主端口"
+
+  input_bytes="$(echo "$json" | jq '[.. | objects | select(.comment? and (.comment|startswith("hy2-input"))) | .expr[]? | .counter.bytes?] | add // 0')"
+  output_bytes="$(echo "$json" | jq '[.. | objects | select(.comment? and (.comment|startswith("hy2-output"))) | .expr[]? | .counter.bytes?] | add // 0')"
+  total_bytes=$((input_bytes + output_bytes))
+
+  main_in="$(echo "$json" | jq '[.. | objects | select(.comment? and .comment=="hy2-input-main") | .expr[]? | .counter.bytes?] | add // 0')"
+  hop_in="$(echo "$json" | jq '[.. | objects | select(.comment? and .comment=="hy2-input-hop") | .expr[]? | .counter.bytes?] | add // 0')"
+  main_out="$(echo "$json" | jq '[.. | objects | select(.comment? and .comment=="hy2-output-main") | .expr[]? | .counter.bytes?] | add // 0')"
+  hop_out="$(echo "$json" | jq '[.. | objects | select(.comment? and .comment=="hy2-output-hop") | .expr[]? | .counter.bytes?] | add // 0')"
+
+  echo
+  echo "=== Hy2 端口流量（更接近服务商计费） ==="
+  echo "服务器入站（客户端上传到服务器）: $(humanize_bytes "$input_bytes")"
+  echo "服务器出站（服务器上传到客户端）: $(humanize_bytes "$output_bytes")"
+  echo "双向总流量: $(humanize_bytes "$total_bytes")"
+  if [ "$total_bytes" -gt 0 ]; then
+    echo "入站占比: $(awk -v i="$input_bytes" -v t="$total_bytes" 'BEGIN { printf "%.2f%%", (i*100/t) }')"
+    echo "出站占比: $(awk -v o="$output_bytes" -v t="$total_bytes" 'BEGIN { printf "%.2f%%", (o*100/t) }')"
+  fi
+  echo
+  echo "明细："
+  echo "  UDP ${main_port} 入站: $(humanize_bytes "$main_in")"
+  echo "  UDP hop 入站:   $(humanize_bytes "$hop_in")"
+  echo "  UDP ${main_port} 出站: $(humanize_bytes "$main_out")"
+  echo "  UDP hop 出站:   $(humanize_bytes "$hop_out")"
+  echo
+}
 
 get_primary_port() {
   local listen
@@ -403,6 +612,18 @@ show_realtime_stats() {
     return
   fi
 
+  if ! echo "$online_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo "在线用户接口返回了无效数据"
+    echo
+    return
+  fi
+
+  if ! echo "$traffic_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo "实时流量接口返回了无效数据"
+    echo
+    return
+  fi
+
   echo
   echo "${CYAN}${BOLD}=== 实时在线用户 ===${RESET}"
   echo "$online_json" \
@@ -434,10 +655,10 @@ show_realtime_stats() {
 
 show_month_stats() {
   local month="${1:-$(date +%Y-%m)}"
-  local month_file="${DATA_DIR}/${month}.json"
-  local total_tx total_rx
+  local baseline_file="${DATA_DIR}/${month}.baseline.json"
+  local realtime_json month_json total_tx total_rx baseline_json
 
-  if [ ! -f "$month_file" ]; then
+  if [ ! -f "$baseline_file" ]; then
     echo
     echo "=== 月度流量 ${month} ==="
     echo "暂无月度数据"
@@ -445,13 +666,30 @@ show_month_stats() {
     return
   fi
 
-  if ! jq empty "$month_file" >/dev/null 2>&1; then
+  if ! jq empty "$baseline_file" >/dev/null 2>&1; then
     echo
     echo "=== 月度流量 ${month} ==="
-    echo "月度数据文件格式损坏：$month_file"
+    echo "月度数据文件格式损坏：$baseline_file"
     echo
     return
   fi
+
+  if ! realtime_json="$(fetch_api_json "/traffic")"; then
+    echo
+    echo "获取实时流量数据失败"
+    echo
+    return
+  fi
+
+  if ! echo "$realtime_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo
+    echo "实时流量接口返回了无效数据"
+    echo
+    return
+  fi
+
+  baseline_json="$(cat "$baseline_file")"
+  month_json="$(calc_month_from_baseline "$realtime_json" "$baseline_json")"
 
   echo
   echo "=== 月度流量 ${month}（按总量排序） ==="
@@ -460,10 +698,10 @@ show_month_stats() {
       | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
       | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
       | @tsv
-    " "$month_file" | print_table
+    " <<< "$month_json" | print_table
 
-  total_tx="$(jq -r '[to_entries[].value.tx // 0] | add // 0' "$month_file")"
-  total_rx="$(jq -r '[to_entries[].value.rx // 0] | add // 0' "$month_file")"
+  total_tx="$(echo "$month_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
+  total_rx="$(echo "$month_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
   echo
   echo "月总上传：$(humanize_bytes "$total_tx")"
   echo "月总下载：$(humanize_bytes "$total_rx")"
@@ -481,13 +719,14 @@ stats_menu() {
     echo "2. 实时监控"
     echo "3. 当前月份"
     echo "4. 指定月份"
+    echo "5. Hy2端口流量（更接近账单）"
     echo "0. 返回"
     echo "========================"
     read -r -p "请选择：" choice
 
     case "$choice" in
-      1) show_realtime_stats ;;
-      2) /usr/local/bin/hyll --watch ;;
+      1) show_dashboard ;;
+      2) watch_dashboard ;;
       3) show_month_stats ;;
       4)
         read -r -p "请输入月份（YYYY-MM）：" month
@@ -498,14 +737,46 @@ stats_menu() {
           show_month_stats "$month"
         fi
         ;;
+      5) show_hy2_port_stats ;;
       0) break ;;
       *) echo "输入无效"; echo ;;
     esac
   done
 }
 
+run_cli() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    watch|--watch)
+      watch_dashboard "${2:-3}"
+      ;;
+    dashboard|realtime)
+      show_dashboard "${2:-$(date +%Y-%m)}"
+      ;;
+    month)
+      show_month_stats "${2:-$(date +%Y-%m)}"
+      ;;
+    hy2|port)
+      show_hy2_port_stats
+      ;;
+    "")
+      return 1
+      ;;
+    *)
+      if [[ "$cmd" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+        show_month_stats "$cmd"
+      else
+        echo "未知参数：$cmd"
+        echo "可用参数：watch [秒] | dashboard | realtime | month [YYYY-MM] | hy2"
+        exit 1
+      fi
+      ;;
+  esac
+}
+
 clear_realtime_stats() {
-  local confirm
+  local confirm cleared_json
 
   read -r -p "确认清空实时 hysteria 流量统计吗？[y/N]：" confirm
   case "$confirm" in
@@ -515,11 +786,12 @@ clear_realtime_stats() {
 
   echo
   echo "=== 清空前返回的数据 ==="
-  if ! fetch_api_json "/traffic?clear=1"; then
+  if ! cleared_json="$(fetch_api_json "/traffic?clear=1")"; then
     echo "清空实时流量统计失败"
     echo
     return
   fi
+  echo "$cleared_json"
   echo
   echo "实时流量统计已清空"
   echo
@@ -570,7 +842,7 @@ add_user() {
     set_default_user "$user"
   fi
 
-  restart_hihy || true
+  restart_or_rollback || return 1
   echo
   echo "已添加用户：$user"
   echo "密码：$pass"
@@ -612,7 +884,7 @@ del_user() {
         clear_default_user
       fi
     fi
-    restart_hihy || true
+    restart_or_rollback || return 1
   else
     ensure_disabled_file
     yq eval "del(.users.\"${user}\")" -i "$DISABLED_FILE"
@@ -635,7 +907,7 @@ change_user_password() {
 
   backup_files
   yq eval ".auth.userpass.\"${user}\" = \"${pass}\"" -i "$CONFIG_FILE"
-  restart_hihy || true
+  restart_or_rollback || return 1
 
   echo
   echo "密码已更新：$user"
@@ -676,7 +948,7 @@ disable_user() {
     fi
   fi
 
-  restart_hihy || true
+  restart_or_rollback || return 1
   echo
   echo "已禁用用户：$user"
   echo
@@ -702,7 +974,7 @@ enable_user() {
     set_default_user "$user"
   fi
 
-  restart_hihy || true
+  restart_or_rollback || return 1
   echo
   echo "已启用用户：$user"
   echo
@@ -757,5 +1029,10 @@ need_cmd curl
   echo "未找到配置文件：$CONFIG_FILE"
   exit 1
 }
+
+if [ $# -gt 0 ]; then
+  run_cli "$@"
+  exit 0
+fi
 
 main_menu

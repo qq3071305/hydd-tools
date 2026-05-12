@@ -1,168 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-CONFIG_FILE="/etc/hihy/conf/config.yaml"
-DATA_DIR="/root/hyll-data"
-WATCH_MODE="${1:-}"
-WATCH_INTERVAL="${2:-3}"
-MONTH_ARG="${1:-}"
+HYDD_BIN="${HYDD_BIN:-/usr/local/bin/hydd}"
 
-if [ "$WATCH_MODE" = "--watch" ] || [ "$WATCH_MODE" = "watch" ]; then
-  MONTH_ARG="$(date +%Y-%m)"
-else
-  WATCH_MODE=""
+if [ ! -x "$HYDD_BIN" ]; then
+  echo "未找到可执行的 hydd：$HYDD_BIN"
+  exit 1
 fi
 
-MONTH="${MONTH_ARG:-$(date +%Y-%m)}"
-BASELINE_FILE="$DATA_DIR/${MONTH}.baseline.json"
-
-SECRET="$(yq eval '.trafficStats.secret' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
-LISTEN="$(yq eval '.trafficStats.listen' "$CONFIG_FILE" 2>/dev/null | sed '/^null$/d')"
-BASE="http://${LISTEN}"
-
-human_jq='
-def human_pair:
-  ((((. / 1048576) * 100 | round) / 100 | tostring) + "MB (" +
-  (((. / 1073741824) * 100 | round) / 100 | tostring) + "GB)");
-'
-
-if [ -t 1 ]; then
-  GREEN="$(printf '\033[32m')"
-  CYAN="$(printf '\033[36m')"
-  BOLD="$(printf '\033[1m')"
-  RESET="$(printf '\033[0m')"
-else
-  GREEN=""
-  CYAN=""
-  BOLD=""
-  RESET=""
-fi
-
-print_table() {
-  if command -v column >/dev/null 2>&1; then
-    column -t -s $'\t'
-  else
-    cat
-  fi
-}
-
-humanize_bytes() {
-  local bytes="${1:-0}"
-  awk -v b="$bytes" 'BEGIN {
-    mb = b / 1048576;
-    gb = b / 1073741824;
-    printf "%.2fMB (%.2fGB)", mb, gb;
-  }'
-}
-
-need_config() {
-  [ -n "$SECRET" ] || {
-    echo "未找到 trafficStats.secret 配置"
-    exit 1
-  }
-  [ -n "$LISTEN" ] || {
-    echo "未找到 trafficStats.listen 配置"
-    exit 1
-  }
-}
-
-fetch_json() {
-  local endpoint="$1"
-  curl -fsS -H "Authorization: $SECRET" "${BASE}${endpoint}"
-}
-
-calc_month_from_baseline() {
-  local current_json="$1"
-  local baseline_json="$2"
-  echo "$current_json" | jq -r --argjson base "$baseline_json" '
-    def users:
-      (. + $base) | keys_unsorted[];
-
-    reduce users as $u
-      ({};
-        .[$u] = {
-          tx: ((.[ $u ].tx // 0) - ($base[$u].tx // 0) | if . < 0 then 0 else . end),
-          rx: ((.[ $u ].rx // 0) - ($base[$u].rx // 0) | if . < 0 then 0 else . end)
-        }
-      )
-  '
-}
-
-render_once() {
-  local realtime_json total_tx total_rx
-  local month_json month_tx month_rx baseline_json
-
-  echo
-  echo "${CYAN}${BOLD}=== 在线用户 ===${RESET}"
-  if online_json="$(fetch_json "/online")"; then
-    echo "$online_json" \
-    | jq -r '
-      to_entries
-      | sort_by(-(.value // 0), .key)
-      | (["用户","在线数"], ["----","------"], (.[] | [.key, (.value|tostring)]))
-      | @tsv
-    ' | print_table
-  else
-    echo "获取在线用户数据失败。"
-  fi
-
-  echo
-  echo "${GREEN}${BOLD}=== 实时流量 ===${RESET}"
-  if realtime_json="$(fetch_json "/traffic")"; then
-    echo "$realtime_json" \
-    | jq -r "$human_jq
-      to_entries
-      | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-      | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
-      | @tsv
-    " | print_table
-
-    total_tx="$(echo "$realtime_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
-    total_rx="$(echo "$realtime_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
-    echo
-    echo "${GREEN}总上传：$(humanize_bytes "$total_tx")${RESET}"
-    echo "${GREEN}总下载：$(humanize_bytes "$total_rx")${RESET}"
-    echo "${GREEN}${BOLD}总流量：$(humanize_bytes $((total_tx + total_rx)))${RESET}"
-
-    echo
-    echo "${CYAN}${BOLD}=== 本月累计（基于月初基线，${MONTH}） ===${RESET}"
-    if [ -f "$BASELINE_FILE" ] && jq empty "$BASELINE_FILE" >/dev/null 2>&1; then
-      baseline_json="$(cat "$BASELINE_FILE")"
-      month_json="$(calc_month_from_baseline "$realtime_json" "$baseline_json")"
-
-      echo "$month_json" \
-      | jq -r "$human_jq
-        to_entries
-        | sort_by(-((.value.tx // 0) + (.value.rx // 0)), .key)
-        | ([\"用户\",\"上传(MB/GB)\",\"下载(MB/GB)\",\"总计(MB/GB)\"], [\"----\",\"-----------\",\"-----------\",\"-----------\"], (.[] | [.key, (.value.tx|human_pair), (.value.rx|human_pair), ((.value.tx + .value.rx)|human_pair)]))
-        | @tsv
-      " | print_table
-
-      month_tx="$(echo "$month_json" | jq -r '[to_entries[].value.tx // 0] | add // 0')"
-      month_rx="$(echo "$month_json" | jq -r '[to_entries[].value.rx // 0] | add // 0')"
-      echo
-      echo "月总上传：$(humanize_bytes "$month_tx")"
-      echo "月总下载：$(humanize_bytes "$month_rx")"
-      echo "月总流量：$(humanize_bytes $((month_tx + month_rx)))"
-    else
-      echo "暂无本月基线，请先运行 /root/hyll-record.sh 建立基线。"
-    fi
-  else
-    echo "获取实时流量数据失败。"
-  fi
-  echo
-}
-
-need_config
-
-if [ -n "$WATCH_MODE" ]; then
-  while true; do
-    clear
-    echo "${GREEN}${BOLD}实时流量监控中，每 ${WATCH_INTERVAL} 秒刷新一次${RESET}"
-    echo "按 Ctrl+C 退出"
-    render_once
-    sleep "$WATCH_INTERVAL"
-  done
-else
-  render_once
-fi
+case "${1:-}" in
+  watch|--watch)
+    exec "$HYDD_BIN" watch "${2:-3}"
+    ;;
+  "" )
+    exec "$HYDD_BIN" dashboard
+    ;;
+  *)
+    exec "$HYDD_BIN" month "$1"
+    ;;
+esac
